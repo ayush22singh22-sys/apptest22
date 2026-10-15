@@ -14,7 +14,7 @@ object Uploader {
 
     /** Uploads every finished drive that has no ".uploaded" marker yet. Safe to call repeatedly. */
     fun uploadPending(dir: File, base: String): String {
-        val csvs = dir.listFiles { f -> f.name.endsWith(".csv") && !f.name.endsWith("_markers.csv") }
+        val csvs = dir.listFiles { f -> f.name.endsWith(".csv") && !f.name.endsWith("_markers.csv") && !f.name.endsWith("_events.csv") }
             ?: return "no drives"
         var ok = 0
         var fail = 0
@@ -27,8 +27,9 @@ object Uploader {
             val metaFile = File(dir, "${id}_meta.json")
             val meta = if (metaFile.exists()) JSONObject(metaFile.readText()) else JSONObject()
             val markers = File(dir, "${id}_markers.csv").takeIf { it.exists() }
+            val events = File(dir, "${id}_events.csv").takeIf { f -> f.exists() && f.useLines { ls -> ls.take(2).count() > 1 } }
             try {
-                done.writeText(post(base, csv, meta, markers))
+                done.writeText(post(base, csv, meta, markers, events))
                 ok++
             } catch (e: Exception) {
                 fail++
@@ -39,7 +40,7 @@ object Uploader {
         else "uploaded $ok, failed $fail" + if (fail > 0) " ($lastError)" else ""
     }
 
-    private fun post(base: String, csv: File, meta: JSONObject, markers: File?): String {
+    private fun post(base: String, csv: File, meta: JSONObject, markers: File?, events: File?): String {
         val b = "----rcm" + System.currentTimeMillis()
         val conn = URL(base.trimEnd('/') + "/upload").openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
@@ -65,6 +66,7 @@ object Uploader {
             field("meta", meta.toString())
             file("file", csv)
             if (markers != null) file("markers", markers)
+            if (events != null) file("events", events)
             o.writeBytes("--$b--\r\n")
         }
         val code = conn.responseCode

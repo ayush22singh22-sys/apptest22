@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.InputType
 import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
@@ -30,6 +31,8 @@ class MainActivity : Activity() {
     private lateinit var mount: EditText
     private lateinit var car: RadioButton
     private lateinit var live: CheckBox
+    private lateinit var thr: EditText
+    private lateinit var minSpd: EditText
     private val ui = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() { refresh(); ui.postDelayed(this, 1000) }
@@ -61,6 +64,18 @@ class MainActivity : Activity() {
         add(grp)
         live = CheckBox(this).apply { text = "Live stream to dashboard (tests only)"; isChecked = prefs.getBoolean("live", false) }
         add(live)
+        add(label("Bump sensitivity: jolt threshold, m/s2 (lower = more sensitive)"))
+        thr = EditText(this).apply {
+            setText(prefs.getString("thr", "3.0"))
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        add(thr)
+        add(label("Ignore bumps below this speed, km/h (0 = always on, for a desk test)"))
+        minSpd = EditText(this).apply {
+            setText(prefs.getString("minSpd", "8"))
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        add(minSpd)
         add(btn("1. Allow background use (battery)") {
             startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
         })
@@ -99,14 +114,18 @@ class MainActivity : Activity() {
     private fun doStart() {
         if (LoggerService.running) return
         val vehicle = if (car.isChecked) "car" else "bike"
+        val th = thr.text.toString().toFloatOrNull() ?: 3f
+        val ms = minSpd.text.toString().toFloatOrNull() ?: 8f
         getSharedPreferences("rcm", MODE_PRIVATE).edit()
             .putString("server", server.text.toString().trim()).putString("phone", phone.text.toString())
             .putString("mount", mount.text.toString()).putString("vehicle", vehicle)
+            .putString("thr", thr.text.toString()).putString("minSpd", minSpd.text.toString())
             .putBoolean("live", live.isChecked).apply()
         startForegroundService(Intent(this, LoggerService::class.java)
             .putExtra("vehicle", vehicle).putExtra("phone", phone.text.toString())
             .putExtra("mount", mount.text.toString()).putExtra("server", server.text.toString().trim())
-            .putExtra("live", live.isChecked))
+            .putExtra("live", live.isChecked)
+            .putExtra("threshold", th).putExtra("minSpeed", ms))
     }
 
     private fun testConnection() {
@@ -139,6 +158,9 @@ class MainActivity : Activity() {
                 .append("rows: ").append(LoggerService.rows).append("   ")
                 .append(String.format("%.1f", LoggerService.hz)).append(" Hz\n")
                 .append("GPS: ").append(LoggerService.gpsText).append('\n')
+                .append("tilt: ").append(LoggerService.tiltText).append('\n')
+                .append("bumps: ").append(LoggerService.events).append("   last: ").append(LoggerService.lastEvent)
+                .append(" (").append(LoggerService.eventStatus).append(")\n")
                 .append("live: ").append(LoggerService.liveStatus).append('\n')
         } else {
             s.append("Not recording\n")

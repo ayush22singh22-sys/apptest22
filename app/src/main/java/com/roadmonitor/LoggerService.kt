@@ -45,7 +45,13 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
         @Volatile var uploadStatus = "-"
         fun mark(label: String) { instance?.writeMark(label) }
         private const val HEADER =
-            "timestamp_ms,ax,ay,az,lat,lon,speed_kmh,gps_accuracy_m,bearing_deg,gps_age_ms\n"
+            "timestamp_ms,ax,ay,az,lat,lon,speed_kmh,gps_accuracy_m,bearing_deg,gps_age_ms,pitch_deg,roll_deg,vert_ms2\n"
+        private const val EVENT_HEADER =
+            "timestamp_ms,lat,lon,speed_kmh,peak_ms2,p2p_ms2,kind,severity,pitch_deg,roll_deg\n"
+        @Volatile var tiltText = "-"
+        @Volatile var events = 0
+        @Volatile var lastEvent = "-"
+        @Volatile var eventStatus = "-"
     }
 
     private var sm: SensorManager? = null
@@ -54,6 +60,11 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
     private var thread: HandlerThread? = null
     private var csvOut: BufferedWriter? = null
     private var markOut: BufferedWriter? = null
+    private var evOut: BufferedWriter? = null
+    private var det = BumpDetector()
+    private var evLat: Double? = null
+    private var evLon: Double? = null
+    private var evSpeed: Float? = null
     private var dir: File? = null
     private var metaFile: File? = null
     private var meta = JSONObject()
@@ -78,6 +89,7 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
         val mount = intent.getStringExtra("mount") ?: ""
         server = intent.getStringExtra("server") ?: ""
         liveOn = intent.getBooleanExtra("live", false) && server.isNotBlank()
+        det = BumpDetector(intent.getFloatExtra("threshold", 3f), intent.getFloatExtra("minSpeed", 8f))
         startForegroundNow()
 
         val d = Uploader.driveDir(this)
@@ -86,6 +98,7 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
         driveId = id
         val csv = File(d, "${id}_${SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())}_$vehicle.csv")
         csvOut = BufferedWriter(FileWriter(csv), 1 shl 16).also { it.write(HEADER) }
+        evOut = BufferedWriter(FileWriter(File(d, "${id}_events.csv"))).also { it.write(EVENT_HEADER); it.flush() }
         metaFile = File(d, "${id}_meta.json")
         meta = JSONObject()
             .put("drive_id", id).put("vehicle_type", vehicle).put("phone_model", device)
@@ -100,6 +113,7 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
         // Hardware timestamps (nanoseconds since boot) are converted to epoch milliseconds.
         epochOffsetMs = System.currentTimeMillis() - SystemClock.elapsedRealtimeNanos() / 1_000_000L
         rows = 0; hz = 0.0; gpsText = "no fix"; liveStatus = "-"
+        tiltText = "-"; events = 0; lastEvent = "-"; eventStatus = "-"
         t0 = SystemClock.elapsedRealtime(); lastFlush = t0; lastStatT = t0; lastStatN = 0
         running = true
         instance = this
@@ -140,6 +154,13 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
         } else {
             sb.append(",,,,,,")
         }
+        // tilt + bump detection (fresh GPS speed only; unknown speed is passed as null)
+        val speed: Float? =
+            if (l != null && l.hasSpeed() && (e.timestamp - l.elapsedRealtimeNanos) < 3_000_000_000L) l.speed * 3.6f else null
+        val bump = det.update(ts, e.values[0], e.values[1], e.values[2], speed)
+        if (det.justStarted) { evLat = l?.latitude; evLon = l?.longitude; evSpeed = speed }
+        sb.append(',').append(r(det.pitch, 10f)).append(',').append(r(det.roll, 10f))
+            .append(',').append(r(det.vert, 100f))
         try {
             w.write(sb.toString()); w.write("\n")
         } catch (ex: Exception) {
@@ -150,11 +171,13 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
             synchronized(liveBuf) { if (liveBuf.size < 3000) liveBuf.add(row) }
         }
         rows = rows + 1
+        if (bump != null) onBump(bump)
         val now = SystemClock.elapsedRealtime()
         if (now - lastFlush >= 1000) {
             try { w.flush() } catch (ex: Exception) { }
             hz = (rows - lastStatN) * 1000.0 / (now - lastStatT)
             lastStatT = now; lastStatN = rows; lastFlush = now
+            tiltText = "pitch %.0f deg, roll %.0f deg".format(det.pitch, det.roll)
             if (l != null) {
                 gpsText = "fix, accuracy " + (if (l.hasAccuracy()) l.accuracy.toInt().toString() else "?") +
                         " m, " + (if (l.hasSpeed()) (l.speed * 3.6f).toInt().toString() else "?") + " km/h"
@@ -168,6 +191,49 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
     override fun onProviderEnabled(provider: String) {}
     override fun onProviderDisabled(provider: String) {}
+
+    private fun r2(v: Float): Double = Math.round(v * 100.0) / 100.0
+
+    /** Called on the sensor thread when a bump/pothole window closes: save to events CSV and push to the laptop. */
+    private fun onBump(ev: BumpDetector.Event) {
+        val lat = evLat
+        val lon = evLon
+        val spd = evSpeed
+        events = events + 1
+        lastEvent = "%s %s %.1f m/s2%s".format(ev.kind, ev.severity, ev.peak, if (lat == null) " (no GPS)" else "")
+        try {
+            evOut?.let {
+                it.write("${ev.tsMs},${lat ?: ""},${lon ?: ""},${if (spd != null) r(spd, 100f).toString() else ""}," +
+                        "${r(ev.peak, 100f)},${r(ev.p2p, 100f)},${ev.kind},${ev.severity},${r(det.pitch, 10f)},${r(det.roll, 10f)}\n")
+                it.flush()
+            }
+        } catch (ex: Exception) { }
+        if (server.isBlank()) return
+        val body = JSONObject().put("device", device).put("event", JSONObject()
+            .put("ts", ev.tsMs)
+            .put("lat", lat ?: JSONObject.NULL)
+            .put("lon", lon ?: JSONObject.NULL)
+            .put("speed_kmh", if (spd != null) r2(spd) else JSONObject.NULL)
+            .put("peak", r2(ev.peak)).put("p2p", r2(ev.p2p))
+            .put("kind", ev.kind).put("severity", ev.severity)
+            .put("pitch", r2(det.pitch)).put("roll", r2(det.roll))
+            .put("drive_id", driveId)).toString()
+        val base = server
+        Thread {
+            eventStatus = try {
+                val c = URL(base.trimEnd('/') + "/api/event").openConnection() as HttpURLConnection
+                c.requestMethod = "POST"; c.doOutput = true
+                c.connectTimeout = 3000; c.readTimeout = 3000
+                c.setRequestProperty("Content-Type", "application/json")
+                c.outputStream.use { it.write(body.toByteArray()) }
+                val code = c.responseCode
+                c.disconnect()
+                if (code == 200) "sent" else "HTTP $code"
+            } catch (ex: Exception) {
+                "unreachable, kept in file"
+            }
+        }.start()
+    }
 
     @Synchronized
     private fun writeMark(label: String) {
@@ -211,9 +277,10 @@ class LoggerService : Service(), SensorEventListener, LocationListener {
         try { thread?.join(2000) } catch (e: Exception) { }
         try { csvOut?.flush(); csvOut?.close() } catch (e: Exception) { }
         try { markOut?.close() } catch (e: Exception) { }
+        try { evOut?.flush(); evOut?.close() } catch (e: Exception) { }
         val secs = (SystemClock.elapsedRealtime() - t0) / 1000.0
         try {
-            meta.put("status", "finished").put("ended_at", iso()).put("rows", rows)
+            meta.put("status", "finished").put("ended_at", iso()).put("rows", rows).put("bump_events", events)
                 .put("duration_s", Math.round(secs * 10) / 10.0)
                 .put("avg_hz", if (secs > 0) Math.round(rows / secs * 10) / 10.0 else 0.0)
             saveMeta()
